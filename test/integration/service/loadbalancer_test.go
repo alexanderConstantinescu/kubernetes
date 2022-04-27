@@ -384,11 +384,13 @@ func newServiceController(t *testing.T, client *clientset.Clientset) (*serviceco
 	cloud := &fakecloud.Cloud{}
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	serviceInformer := informerFactory.Core().V1().Services()
+	endpointsInformer := informerFactory.Core().V1().Endpoints()
 	nodeInformer := informerFactory.Core().V1().Nodes()
 
 	controller, err := servicecontroller.New(cloud,
 		client,
 		serviceInformer,
+		endpointsInformer,
 		nodeInformer,
 		"test-cluster",
 		utilfeature.DefaultFeatureGate)

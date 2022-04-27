@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -44,6 +45,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+type nodeInclusionMode int
+
 const (
 	// Interval of synchronizing service status from apiserver
 	serviceSyncPeriod = 30 * time.Second
@@ -58,6 +61,10 @@ const (
 	// ToBeDeletedTaint is a taint used by the CLuster Autoscaler before marking a node for deletion. Defined in
 	// https://github.com/kubernetes/autoscaler/blob/e80ab518340f88f364fe3ef063f8303755125971/cluster-autoscaler/utils/deletetaint/delete.go#L36
 	ToBeDeletedTaint = "ToBeDeletedByClusterAutoscaler"
+	// includeOnlyReadyNodes enables the node condition predicate and includes only all Ready nodes.
+	includeOnlyReadyNodes nodeInclusionMode = iota
+	// includeUnreadyNodes disables the node condition predicate and also includes all NotReady nodes.
+	includeUnreadyNodes
 )
 
 type cachedService struct {
@@ -80,13 +87,15 @@ type Controller struct {
 	clusterName      string
 	balancer         cloudprovider.LoadBalancer
 	// TODO(#85155): Stop relying on this and remove the cache completely.
-	cache               *serviceCache
-	serviceLister       corelisters.ServiceLister
-	serviceListerSynced cache.InformerSynced
-	eventBroadcaster    record.EventBroadcaster
-	eventRecorder       record.EventRecorder
-	nodeLister          corelisters.NodeLister
-	nodeListerSynced    cache.InformerSynced
+	cache                 *serviceCache
+	serviceLister         corelisters.ServiceLister
+	serviceListerSynced   cache.InformerSynced
+	eventBroadcaster      record.EventBroadcaster
+	eventRecorder         record.EventRecorder
+	nodeLister            corelisters.NodeLister
+	nodeListerSynced      cache.InformerSynced
+	endpointsLister       corelisters.EndpointsLister
+	endpointsListerSynced cache.InformerSynced
 	// services that need to be synced
 	queue workqueue.RateLimitingInterface
 
@@ -95,6 +104,12 @@ type Controller struct {
 	nodeSyncLock sync.Mutex
 	// nodeSyncCh triggers nodeSyncLoop to run
 	nodeSyncCh chan interface{}
+	// lastSyncedNodes is used when reconciling node state and keeps track of the last synced set of
+	// nodes. It's different from knownHosts in that: knownHosts tracks the last received event on
+	// the workqueue, which helps avoid incorrect synced state caused by coalesced events.
+	// lastSyncedNodes can be considered coalesced, and represent the last synced state, not the last
+	// received state.
+	lastSyncedNodes []*v1.Node
 	// needFullSync indicates if the nodeSyncInternal will do a full node sync on all LB services.
 	needFullSync bool
 }
@@ -105,6 +120,7 @@ func New(
 	cloud cloudprovider.Interface,
 	kubeClient clientset.Interface,
 	serviceInformer coreinformers.ServiceInformer,
+	endpointsInformer coreinformers.EndpointsInformer,
 	nodeInformer coreinformers.NodeInformer,
 	clusterName string,
 	featureGate featuregate.FeatureGate,
@@ -122,16 +138,18 @@ func New(
 
 	registerMetrics()
 	s := &Controller{
-		cloud:            cloud,
-		knownHosts:       []*v1.Node{},
-		kubeClient:       kubeClient,
-		clusterName:      clusterName,
-		cache:            &serviceCache{serviceMap: make(map[string]*cachedService)},
-		eventBroadcaster: broadcaster,
-		eventRecorder:    recorder,
-		nodeLister:       nodeInformer.Lister(),
-		nodeListerSynced: nodeInformer.Informer().HasSynced,
-		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
+		cloud:                 cloud,
+		knownHosts:            []*v1.Node{},
+		kubeClient:            kubeClient,
+		clusterName:           clusterName,
+		cache:                 &serviceCache{serviceMap: make(map[string]*cachedService)},
+		eventBroadcaster:      broadcaster,
+		eventRecorder:         recorder,
+		nodeLister:            nodeInformer.Lister(),
+		nodeListerSynced:      nodeInformer.Informer().HasSynced,
+		endpointsLister:       endpointsInformer.Lister(),
+		endpointsListerSynced: endpointsInformer.Informer().HasSynced,
+		queue:                 workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
 		// nodeSyncCh has a size 1 buffer. Only one pending sync signal would be cached.
 		nodeSyncCh: make(chan interface{}, 1),
 	}
@@ -233,7 +251,7 @@ func (s *Controller) Run(ctx context.Context, workers int) {
 	klog.Info("Starting service controller")
 	defer klog.Info("Shutting down service controller")
 
-	if !cache.WaitForNamedCacheSync("service", ctx.Done(), s.serviceListerSynced, s.nodeListerSynced) {
+	if !cache.WaitForNamedCacheSync("service", ctx.Done(), s.serviceListerSynced, s.nodeListerSynced, s.endpointsListerSynced) {
 		return
 	}
 
@@ -251,7 +269,7 @@ func (s *Controller) Run(ctx context.Context, workers int) {
 func (s *Controller) triggerNodeSync() {
 	s.nodeSyncLock.Lock()
 	defer s.nodeSyncLock.Unlock()
-	newHosts, err := listWithPredicate(s.nodeLister, s.getNodeConditionPredicate())
+	newHosts, err := listWithPredicate(s.nodeLister, s.getNodeConditionPredicate(includeOnlyReadyNodes))
 	if err != nil {
 		runtime.HandleError(fmt.Errorf("Failed to retrieve current set of nodes from node lister: %v", err))
 		// if node list cannot be retrieve, trigger full node sync to be safe.
@@ -443,7 +461,7 @@ func (s *Controller) syncLoadBalancerIfNeeded(ctx context.Context, service *v1.S
 }
 
 func (s *Controller) ensureLoadBalancer(ctx context.Context, service *v1.Service) (*v1.LoadBalancerStatus, error) {
-	nodes, err := listWithPredicate(s.nodeLister, s.getNodeConditionPredicate())
+	nodes, err := listWithPredicate(s.nodeLister, s.getNodeConditionPredicate(includeOnlyReadyNodes))
 	if err != nil {
 		return nil, err
 	}
@@ -657,6 +675,15 @@ func portEqualForLB(x, y *v1.ServicePort) bool {
 	return true
 }
 
+func serviceKeys(services []*v1.Service) sets.String {
+	ret := sets.NewString()
+	for _, service := range services {
+		key, _ := cache.MetaNamespaceKeyFunc(service)
+		ret.Insert(key)
+	}
+	return ret
+}
+
 func nodeNames(nodes []*v1.Node) sets.String {
 	ret := sets.NewString()
 	for _, node := range nodes {
@@ -672,7 +699,7 @@ func nodeSlicesEqualForLB(x, y []*v1.Node) bool {
 	return nodeNames(x).Equal(nodeNames(y))
 }
 
-func (s *Controller) getNodeConditionPredicate() NodeConditionPredicate {
+func (s *Controller) getNodeConditionPredicate(include nodeInclusionMode) NodeConditionPredicate {
 	return func(node *v1.Node) bool {
 		if _, hasExcludeBalancerLabel := node.Labels[v1.LabelNodeExcludeBalancers]; hasExcludeBalancerLabel {
 			return false
@@ -690,12 +717,14 @@ func (s *Controller) getNodeConditionPredicate() NodeConditionPredicate {
 		if len(node.Status.Conditions) == 0 {
 			return false
 		}
-		for _, cond := range node.Status.Conditions {
-			// We consider the node for load balancing only when its NodeReady condition status
-			// is ConditionTrue
-			if cond.Type == v1.NodeReady && cond.Status != v1.ConditionTrue {
-				klog.V(4).Infof("Ignoring node %v with %v condition status %v", node.Name, cond.Type, cond.Status)
-				return false
+		if include == includeOnlyReadyNodes {
+			for _, cond := range node.Status.Conditions {
+				// We consider the node for load balancing only when its NodeReady condition status
+				// is ConditionTrue
+				if cond.Type == v1.NodeReady && cond.Status != v1.ConditionTrue {
+					klog.V(4).Infof("Ignoring node %v with %v condition status %v", node.Name, cond.Type, cond.Status)
+					return false
+				}
 			}
 		}
 		return true
@@ -765,23 +794,89 @@ func (s *Controller) nodeSyncInternal(ctx context.Context, workers int) {
 		numServices-len(s.servicesToUpdate), numServices)
 }
 
-// nodeSyncService syncs the nodes for one load balancer type service
-func (s *Controller) nodeSyncService(svc *v1.Service) bool {
-	if svc == nil || !wantsLoadBalancer(svc) {
-		return false
-	}
-	klog.V(4).Infof("nodeSyncService started for service %s/%s", svc.Namespace, svc.Name)
-	hosts, err := listWithPredicate(s.nodeLister, s.getNodeConditionPredicate())
-	if err != nil {
-		runtime.HandleError(fmt.Errorf("failed to retrieve node list: %v", err))
-		return true
-	}
-
-	if err := s.lockedUpdateLoadBalancerHosts(svc, hosts); err != nil {
+// nodeSyncService syncs the nodes for one load balancer type service. The return value
+// indicates if we should retry. Hence, this functions returns false if we've updated
+// load balancers and finished doing it successfully. This function returns true if we
+// tried to update load balancers and failed, indicating to the caller that we should
+// try again.
+func (s *Controller) nodeSyncService(svc *v1.Service, newNodes []*v1.Node) bool {
+	newReadyNodes := filterWithPredicate(newNodes, s.getNodeConditionPredicate(includeOnlyReadyNodes))
+	if err := s.lockedUpdateLoadBalancerHosts(svc, newReadyNodes); err != nil {
 		runtime.HandleError(fmt.Errorf("failed to update load balancer hosts for service %s/%s: %v", svc.Namespace, svc.Name, err))
 		return true
 	}
 	klog.V(4).Infof("nodeSyncService finished successfully for service %s/%s", svc.Namespace, svc.Name)
+	return false
+}
+
+// needSync computes if the service should be synced or not. It assumes the caller always
+// provides the current set of Ready and NotReady nodes as newNodes and the last synced set
+// of Ready and NotReady nodes as oldNodes. These are used to compute if ETP=local service
+// might need skipping or not.
+func (s *Controller) needsSync(svc *v1.Service, oldNodes, newNodes []*v1.Node) bool {
+	if svc == nil || !wantsLoadBalancer(svc) {
+		return false
+	}
+
+	klog.V(4).Infof("nodeSyncService started for service %s/%s", svc.Namespace, svc.Name)
+	newReadyNodes := filterWithPredicate(newNodes, s.getNodeConditionPredicate(includeOnlyReadyNodes))
+	// For services of ETP=local: we do not want to sync nodes transitioning from NotReady <-> Ready
+	// if these hosts are not actually hosting any endpoints for the service. Doing that leads to
+	// unnecessary updates for LBs which will never send traffic to the nodes in question in any case.
+	if svc.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal {
+		needsSync := func() bool {
+			// We have four cases to consider here:
+			//   a) Node ADD
+			//   b) Node DEL
+			//   c) Node UPDATE Ready -> NotReady
+			//   d) Node UPDATE NotReady -> Ready
+			// In case of (c) or (d) we can skip sync for ETP=Local Service
+			old := nodeNames(oldNodes)
+			new := nodeNames(newNodes)
+			if !old.Equal(new) {
+				// The set of nodes has changed - needs sync.
+				return true
+			}
+			// The set of nodes didn't change, but maybe readiness did.
+			oldReadyNodes := filterWithPredicate(oldNodes, s.getNodeConditionPredicate(includeOnlyReadyNodes))
+			newReady := nodeNames(newReadyNodes)
+			oldReady := nodeNames(oldReadyNodes)
+			// Figure out which nodes changed readiness.
+			transitioningToNotReady := oldReady.Difference(newReady)
+			transitioningToReady := newReady.Difference(oldReady)
+			if len(transitioningToReady.Difference(oldReady)) > 0 {
+				// If any of the nodes transitioning to Ready were not
+				// previously configured for the LB, do so now - needs sync.
+				return true
+			}
+			transitioningNodes := transitioningToNotReady.Union(transitioningToReady)
+			if s.serviceHasEndpointsOnNodes(svc, transitioningNodes) {
+				// This service has at least 1 endpoint on a changed
+				// node - needs sync.
+				return true
+			}
+			// It seems safe to skip this sync for this service.
+			return false
+		}
+		return needsSync()
+	}
+	return true
+}
+
+func (s *Controller) serviceHasEndpointsOnNodes(svc *v1.Service, nodeNames sets.String) bool {
+	ep, err := s.endpointsLister.Endpoints(svc.Namespace).Get(svc.Name)
+	if err != nil {
+		// The only error returned by the indexer for a Get request is IsNotFound. If we end up here
+		// it means there are no endpoints for the service, so it has no endpoints on any node.
+		return false
+	}
+	for _, subset := range ep.Subsets {
+		for _, address := range subset.Addresses {
+			if address.NodeName != nil && nodeNames.Has(*address.NodeName) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -794,8 +889,26 @@ func (s *Controller) updateLoadBalancerHosts(ctx context.Context, services []*v1
 	// lock for servicesToRetry
 	servicesToRetry = sets.NewString()
 	lock := sync.Mutex{}
+	// Include Ready and NotReady nodes. We want to keep track of all
+	// nodes as to compare all old vs. new nodes. computeSyncOp needs
+	// to be able to discern between a node getting added / removed from
+	// the node LB set, and any node experiencing a transitioning state
+	// in the existing set. If we only keep track of Ready nodes: a node
+	// experiencing a transitioning state would be seen as an add / delete.
+	newNodes, err := listWithPredicate(s.nodeLister, s.getNodeConditionPredicate(includeUnreadyNodes))
+	if err != nil {
+		runtime.HandleError(fmt.Errorf("failed to retrieve node list: %v", err))
+		return serviceKeys(services)
+	}
+
+	updateLastSyncedNodes := int32(0)
+
 	doWork := func(piece int) {
-		if shouldRetry := s.nodeSyncService(services[piece]); !shouldRetry {
+		if !s.needsSync(services[piece], s.lastSyncedNodes, newNodes) {
+			return
+		}
+		if shouldRetry := s.nodeSyncService(services[piece], newNodes); !shouldRetry {
+			atomic.AddInt32(&updateLastSyncedNodes, 1)
 			return
 		}
 		lock.Lock()
@@ -805,6 +918,9 @@ func (s *Controller) updateLoadBalancerHosts(ctx context.Context, services []*v1
 	}
 
 	workqueue.ParallelizeUntil(ctx, workers, len(services), doWork)
+	if atomic.LoadInt32(&updateLastSyncedNodes) == 1 {
+		s.lastSyncedNodes = newNodes
+	}
 	klog.V(4).Infof("Finished updateLoadBalancerHosts")
 	return servicesToRetry
 }
@@ -983,13 +1099,15 @@ func listWithPredicate(nodeLister corelisters.NodeLister, predicate NodeConditio
 	if err != nil {
 		return nil, err
 	}
+	return filterWithPredicate(nodes, predicate), nil
+}
 
+func filterWithPredicate(nodes []*v1.Node, predicate NodeConditionPredicate) []*v1.Node {
 	var filtered []*v1.Node
 	for i := range nodes {
 		if predicate(nodes[i]) {
 			filtered = append(filtered, nodes[i])
 		}
 	}
-
-	return filtered, nil
+	return filtered
 }

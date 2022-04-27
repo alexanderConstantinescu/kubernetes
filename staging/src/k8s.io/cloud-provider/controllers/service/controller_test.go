@@ -40,10 +40,12 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	core "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	fakecloud "k8s.io/cloud-provider/fake"
 	servicehelper "k8s.io/cloud-provider/service/helpers"
+
 	utilpointer "k8s.io/utils/pointer"
 
 	"github.com/stretchr/testify/assert"
@@ -64,6 +66,41 @@ func newService(name string, uid types.UID, serviceType v1.ServiceType) *v1.Serv
 	}
 }
 
+func newETPLocalService(name string, uid types.UID, serviceType v1.ServiceType) *v1.Service {
+	return &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			UID:       uid,
+		},
+		Spec: v1.ServiceSpec{
+			Type:                  serviceType,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+		},
+	}
+}
+
+func newEndpointsOnNodes(name string, uid types.UID, nodes []*v1.Node) *v1.Endpoints {
+	addresses := []v1.EndpointAddress{}
+	for _, node := range nodes {
+		addresses = append(addresses, v1.EndpointAddress{
+			NodeName: &node.Name,
+		})
+	}
+	return &v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			UID:       uid,
+		},
+		Subsets: []v1.EndpointSubset{
+			v1.EndpointSubset{
+				Addresses: addresses,
+			},
+		},
+	}
+}
+
 //Wrap newService so that you don't have to call default arguments again and again.
 func defaultExternalService() *v1.Service {
 	return newService("external-balancer", types.UID("123"), v1.ServiceTypeLoadBalancer)
@@ -71,13 +108,19 @@ func defaultExternalService() *v1.Service {
 
 func alwaysReady() bool { return true }
 
-func newController() (*Controller, *fakecloud.Cloud, *fake.Clientset) {
+type fakeController struct {
+	*Controller
+	endpointsStore cache.Store
+}
+
+func newController() (*fakeController, *fakecloud.Cloud, *fake.Clientset) {
 	cloud := &fakecloud.Cloud{}
 	cloud.Region = region
 
 	kubeClient := fake.NewSimpleClientset()
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	serviceInformer := informerFactory.Core().V1().Services()
+	endpointsInformer := informerFactory.Core().V1().Endpoints()
 	nodeInformer := informerFactory.Core().V1().Nodes()
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartStructuredLogging(0)
@@ -85,17 +128,20 @@ func newController() (*Controller, *fakecloud.Cloud, *fake.Clientset) {
 	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "service-controller"})
 
 	controller := &Controller{
-		cloud:            cloud,
-		knownHosts:       []*v1.Node{},
-		kubeClient:       kubeClient,
-		clusterName:      "test-cluster",
-		cache:            &serviceCache{serviceMap: make(map[string]*cachedService)},
-		eventBroadcaster: broadcaster,
-		eventRecorder:    recorder,
-		nodeLister:       newFakeNodeLister(nil),
-		nodeListerSynced: nodeInformer.Informer().HasSynced,
-		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
-		nodeSyncCh:       make(chan interface{}, 1),
+		cloud:                 cloud,
+		knownHosts:            []*v1.Node{},
+		kubeClient:            kubeClient,
+		clusterName:           "test-cluster",
+		cache:                 &serviceCache{serviceMap: make(map[string]*cachedService)},
+		eventBroadcaster:      broadcaster,
+		eventRecorder:         recorder,
+		nodeLister:            newFakeNodeLister(nil),
+		nodeListerSynced:      nodeInformer.Informer().HasSynced,
+		endpointsLister:       endpointsInformer.Lister(),
+		endpointsListerSynced: endpointsInformer.Informer().HasSynced,
+		queue:                 workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
+		nodeSyncCh:            make(chan interface{}, 1),
+		lastSyncedNodes:       []*v1.Node{},
 	}
 
 	balancer, _ := cloud.LoadBalancer()
@@ -107,10 +153,15 @@ func newController() (*Controller, *fakecloud.Cloud, *fake.Clientset) {
 	controller.serviceListerSynced = alwaysReady
 	controller.eventRecorder = record.NewFakeRecorder(100)
 
+	fakeController := &fakeController{
+		Controller:     controller,
+		endpointsStore: endpointsInformer.Informer().GetStore(),
+	}
+
 	cloud.Calls = nil         // ignore any cloud calls made in init()
 	kubeClient.ClearActions() // ignore any client calls made in init()
 
-	return controller, cloud, kubeClient
+	return fakeController, cloud, kubeClient
 }
 
 // TODO(@MrHohn): Verify the end state when below issue is resolved:
@@ -559,6 +610,629 @@ func TestUpdateNodesInExternalLoadBalancer(t *testing.T) {
 	}
 }
 
+func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
+	node1 := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node0"}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}
+	node2 := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}
+	node2NotReady := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionFalse}}}}
+	node2SpuriousChange := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}, Status: v1.NodeStatus{Phase: v1.NodeTerminated, Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}
+	node3 := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node73"}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}
+	node3NotReady := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node73"}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionFalse}}}}
+
+	type stateChanges struct {
+		nodes          []*v1.Node
+		endpointSlices []*v1.Endpoints
+		syncCallErr    bool
+	}
+
+	type initialLBState struct {
+		service *v1.Service
+		nodes   []*v1.Node
+	}
+
+	for _, tc := range []struct {
+		desc                string
+		expectedUpdateCalls []fakecloud.UpdateBalancerCall
+		stateChanges        []stateChanges
+		initialLBState      []initialLBState
+	}{
+		{
+			desc: "No node changes",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{},
+		},
+		{
+			desc: "1 new node gets added",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+			},
+		},
+		{
+			desc: "1 old node gets deleted",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+			},
+		},
+		{
+			desc: "1 node transitions from Ready -> NotReady - but hosts no endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2, node3NotReady},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{},
+		},
+		{
+			desc: "1 node transitions from Ready -> NotReady - and hosts endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2NotReady, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+			},
+		},
+		{
+			desc: "1 spurious node update",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2SpuriousChange, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{},
+		},
+		{
+			desc: "1 node transitions from NotReady -> Ready - hosts no endpoints but was somehow already in the LB set",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3NotReady},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+			},
+		},
+		{
+			desc: "1 node transitions from NotReady -> Ready - hosts endpoints and was somehow already in the LB set",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+			},
+		},
+		{
+			desc: "1 node transitions from Ready -> NotReady - services have no endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2NotReady, node3},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{},
+		},
+		{
+			desc: "1 node transitions from NotReady -> Ready - services have no endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2, node3},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+			},
+		},
+		{
+			desc: "2 coalesced node updates, 1 node transitions from Ready -> NotReady with no endpoints and one from NotReady -> Ready with endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2NotReady, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2, node3NotReady},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+			},
+		},
+		{
+			desc: "2 coalesced node updates, 1 node deleted and 1 node added - added hosts endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node3},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node3},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node3},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2}},
+			},
+		},
+		{
+			desc: "2 coalesced node updates, 1 node deleted and 1 node added - added hosts no endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+				{
+					service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+				{
+					service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+				{
+					service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+			},
+		},
+		{
+			desc: "2 state changes, test endpoints eviction post NotReady node",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					// Assume node transitions to NotReady
+					nodes: []*v1.Node{node1, node2NotReady, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					},
+				},
+				{
+					// Assume node transitions back to Ready
+					nodes: []*v1.Node{node1, node2, node3},
+					endpointSlices: []*v1.Endpoints{
+						// Assume endpoints has been evicted from the NotReady node
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				// The update calls should have the node removed and added back to the LB set
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node2, node3}},
+			},
+		},
+		{
+			desc: "2 state changes, for node transitioning between Ready <-> NotReady with no endpoints",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					// Assume node without any endpoints transitions to NotReady
+					nodes: []*v1.Node{node1, node2, node3NotReady},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					},
+				},
+				{
+					// Assume same node transitions back into Ready
+					nodes: []*v1.Node{node1, node2, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					},
+				},
+			},
+			// No update calls since the node doesn't host any endpoints for this service.
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{},
+		},
+		{
+			desc: "2 state changes, with one cloud error in between",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2NotReady, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					},
+					// Assume the update call will fail
+					syncCallErr: true,
+				},
+				{
+					nodes: []*v1.Node{node1, node2NotReady, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				// The update calls should be repeated with the same state.
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+			},
+		},
+		{
+			desc: "2 state changes, with one cloud error in between and endpoints change between syncs",
+			initialLBState: []initialLBState{
+				{
+					service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer),
+					nodes:   []*v1.Node{node1, node2, node3},
+				},
+			},
+			stateChanges: []stateChanges{
+				{
+					nodes: []*v1.Node{node1, node2NotReady, node3},
+					endpointSlices: []*v1.Endpoints{
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					},
+					// Assume the update call will fail
+					syncCallErr: true,
+				},
+				{
+					nodes: []*v1.Node{node1, node2NotReady, node3},
+					endpointSlices: []*v1.Endpoints{
+						// Suppose the pod is deleted from node2 while we're processing the delta between both syncs
+						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+					},
+				},
+			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
+				// We should only have one total update call: the one for when we tried but errored.
+				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			controller, cloud, _ := newController()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			services := []*v1.Service{}
+			for _, state := range tc.initialLBState {
+				controller.lastSyncedNodes = state.nodes
+				services = append(services, state.service)
+			}
+
+			for _, state := range tc.stateChanges {
+				setupState := func() {
+					controller.nodeLister = newFakeNodeLister(nil, state.nodes...)
+					for _, endpointSlice := range state.endpointSlices {
+						controller.endpointsStore.Add(endpointSlice)
+					}
+					if state.syncCallErr {
+						cloud.Err = fmt.Errorf("error please")
+					}
+				}
+				cleanupState := func() {
+					for _, endpointSlice := range state.endpointSlices {
+						controller.endpointsStore.Delete(endpointSlice)
+					}
+					cloud.Err = nil
+				}
+				setupState()
+				controller.updateLoadBalancerHosts(ctx, services, 3)
+				cleanupState()
+			}
+
+			compareUpdateCalls(t, tc.expectedUpdateCalls, cloud.UpdateCalls)
+		})
+	}
+}
+
 func TestNodeChangesInExternalLoadBalancer(t *testing.T) {
 	node1 := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node0"}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}
 	node2 := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}
@@ -832,7 +1506,7 @@ func TestProcessServiceCreateOrUpdateK8sError(t *testing.T) {
 
 func TestSyncService(t *testing.T) {
 
-	var controller *Controller
+	var controller *fakeController
 
 	testCases := []struct {
 		testName   string
@@ -913,19 +1587,19 @@ func TestSyncService(t *testing.T) {
 
 func TestProcessServiceDeletion(t *testing.T) {
 
-	var controller *Controller
+	var controller *fakeController
 	var cloud *fakecloud.Cloud
 	// Add a global svcKey name
 	svcKey := "external-balancer"
 
 	testCases := []struct {
 		testName   string
-		updateFn   func(*Controller)        // Update function used to manipulate srv and controller values
+		updateFn   func(*fakeController)    // Update function used to manipulate srv and controller values
 		expectedFn func(svcErr error) error // Function to check if the returned value is expected
 	}{
 		{
 			testName: "If a non-existent service is deleted",
-			updateFn: func(controller *Controller) {
+			updateFn: func(controller *fakeController) {
 				// Does not do anything
 			},
 			expectedFn: func(svcErr error) error {
@@ -934,7 +1608,7 @@ func TestProcessServiceDeletion(t *testing.T) {
 		},
 		{
 			testName: "If cloudprovided failed to delete the service",
-			updateFn: func(controller *Controller) {
+			updateFn: func(controller *fakeController) {
 
 				svc := controller.cache.getOrCreate(svcKey)
 				svc.state = defaultExternalService()
@@ -954,7 +1628,7 @@ func TestProcessServiceDeletion(t *testing.T) {
 		},
 		{
 			testName: "If delete was successful",
-			updateFn: func(controller *Controller) {
+			updateFn: func(controller *fakeController) {
 
 				testSvc := defaultExternalService()
 				controller.enqueueService(testSvc)
@@ -1586,7 +2260,7 @@ func Test_getNodeConditionPredicate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &Controller{}
 
-			if result := c.getNodeConditionPredicate()(tt.input); result != tt.want {
+			if result := c.getNodeConditionPredicate(includeOnlyReadyNodes)(tt.input); result != tt.want {
 				t.Errorf("getNodeConditionPredicate() = %v, want %v", result, tt.want)
 			}
 		})
