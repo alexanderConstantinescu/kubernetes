@@ -27,6 +27,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -80,24 +81,23 @@ func newETPLocalService(name string, uid types.UID, serviceType v1.ServiceType) 
 	}
 }
 
-func newEndpointsOnNodes(name string, uid types.UID, nodes []*v1.Node) *v1.Endpoints {
-	addresses := []v1.EndpointAddress{}
+func newEndpointSliceOnNodes(name string, uid types.UID, nodes []*v1.Node) *discovery.EndpointSlice {
+	endpoints := []discovery.Endpoint{}
 	for _, node := range nodes {
-		addresses = append(addresses, v1.EndpointAddress{
+		endpoints = append(endpoints, discovery.Endpoint{
 			NodeName: &node.Name,
 		})
 	}
-	return &v1.Endpoints{
+	return &discovery.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: "default",
 			UID:       uid,
-		},
-		Subsets: []v1.EndpointSubset{
-			v1.EndpointSubset{
-				Addresses: addresses,
+			Labels: map[string]string{
+				discovery.LabelServiceName: name,
 			},
 		},
+		Endpoints: endpoints,
 	}
 }
 
@@ -110,7 +110,7 @@ func alwaysReady() bool { return true }
 
 type fakeController struct {
 	*Controller
-	endpointsStore cache.Store
+	endpointSliceStore cache.Store
 }
 
 func newController() (*fakeController, *fakecloud.Cloud, *fake.Clientset) {
@@ -120,7 +120,7 @@ func newController() (*fakeController, *fakecloud.Cloud, *fake.Clientset) {
 	kubeClient := fake.NewSimpleClientset()
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
 	serviceInformer := informerFactory.Core().V1().Services()
-	endpointsInformer := informerFactory.Core().V1().Endpoints()
+	endpointSliceInformer := informerFactory.Discovery().V1().EndpointSlices()
 	nodeInformer := informerFactory.Core().V1().Nodes()
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartStructuredLogging(0)
@@ -128,20 +128,20 @@ func newController() (*fakeController, *fakecloud.Cloud, *fake.Clientset) {
 	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "service-controller"})
 
 	controller := &Controller{
-		cloud:                 cloud,
-		knownHosts:            []*v1.Node{},
-		kubeClient:            kubeClient,
-		clusterName:           "test-cluster",
-		cache:                 &serviceCache{serviceMap: make(map[string]*cachedService)},
-		eventBroadcaster:      broadcaster,
-		eventRecorder:         recorder,
-		nodeLister:            newFakeNodeLister(nil),
-		nodeListerSynced:      nodeInformer.Informer().HasSynced,
-		endpointsLister:       endpointsInformer.Lister(),
-		endpointsListerSynced: endpointsInformer.Informer().HasSynced,
-		queue:                 workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
-		nodeSyncCh:            make(chan interface{}, 1),
-		lastSyncedNodes:       []*v1.Node{},
+		cloud:               cloud,
+		knownHosts:          []*v1.Node{},
+		kubeClient:          kubeClient,
+		clusterName:         "test-cluster",
+		cache:               &serviceCache{serviceMap: make(map[string]*cachedService)},
+		eventBroadcaster:    broadcaster,
+		eventRecorder:       recorder,
+		nodeLister:          newFakeNodeLister(nil),
+		nodeListerSynced:    nodeInformer.Informer().HasSynced,
+		endpointSliceLister: endpointSliceInformer.Lister(),
+		endpointSliceSynced: endpointSliceInformer.Informer().HasSynced,
+		queue:               workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
+		nodeSyncCh:          make(chan interface{}, 1),
+		lastSyncedNodes:     []*v1.Node{},
 	}
 
 	balancer, _ := cloud.LoadBalancer()
@@ -154,8 +154,8 @@ func newController() (*fakeController, *fakecloud.Cloud, *fake.Clientset) {
 	controller.eventRecorder = record.NewFakeRecorder(100)
 
 	fakeController := &fakeController{
-		Controller:     controller,
-		endpointsStore: endpointsInformer.Informer().GetStore(),
+		Controller:         controller,
+		endpointSliceStore: endpointSliceInformer.Informer().GetStore(),
 	}
 
 	cloud.Calls = nil         // ignore any cloud calls made in init()
@@ -620,7 +620,7 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 
 	type stateChanges struct {
 		nodes          []*v1.Node
-		endpointSlices []*v1.Endpoints
+		endpointSlices []*discovery.EndpointSlice
 		syncCallErr    bool
 	}
 
@@ -658,11 +658,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -691,11 +691,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -729,11 +729,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -767,11 +767,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2, node3NotReady},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -800,11 +800,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2NotReady, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -836,11 +836,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2SpuriousChange, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -857,8 +857,8 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
 					},
 				},
 			},
@@ -889,11 +889,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -986,11 +986,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2, node3NotReady},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -1024,11 +1024,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -1062,11 +1062,11 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
-						newEndpointsOnNodes("s1", "888", []*v1.Node{node1}),
-						newEndpointsOnNodes("s3", "999", []*v1.Node{node2}),
-						newEndpointsOnNodes("s4", "123", []*v1.Node{node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s1", "888", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s3", "999", []*v1.Node{node2}),
+						newEndpointSliceOnNodes("s4", "123", []*v1.Node{node2}),
 					},
 				},
 			},
@@ -1089,16 +1089,16 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 				{
 					// Assume node transitions to NotReady
 					nodes: []*v1.Node{node1, node2NotReady, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1, node2}),
 					},
 				},
 				{
 					// Assume node transitions back to Ready
 					nodes: []*v1.Node{node1, node2, node3},
-					endpointSlices: []*v1.Endpoints{
+					endpointSlices: []*discovery.EndpointSlice{
 						// Assume endpoints has been evicted from the NotReady node
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
 					},
 				},
 			},
@@ -1120,15 +1120,15 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 				{
 					// Assume node without any endpoints transitions to NotReady
 					nodes: []*v1.Node{node1, node2, node3NotReady},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1, node2}),
 					},
 				},
 				{
 					// Assume same node transitions back into Ready
 					nodes: []*v1.Node{node1, node2, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1, node2}),
 					},
 				},
 			},
@@ -1146,16 +1146,16 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2NotReady, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1, node2}),
 					},
 					// Assume the update call will fail
 					syncCallErr: true,
 				},
 				{
 					nodes: []*v1.Node{node1, node2NotReady, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1, node2}),
 					},
 				},
 			},
@@ -1176,17 +1176,17 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			stateChanges: []stateChanges{
 				{
 					nodes: []*v1.Node{node1, node2NotReady, node3},
-					endpointSlices: []*v1.Endpoints{
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1, node2}),
+					endpointSlices: []*discovery.EndpointSlice{
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1, node2}),
 					},
 					// Assume the update call will fail
 					syncCallErr: true,
 				},
 				{
 					nodes: []*v1.Node{node1, node2NotReady, node3},
-					endpointSlices: []*v1.Endpoints{
+					endpointSlices: []*discovery.EndpointSlice{
 						// Suppose the pod is deleted from node2 while we're processing the delta between both syncs
-						newEndpointsOnNodes("s0", "777", []*v1.Node{node1}),
+						newEndpointSliceOnNodes("s0", "777", []*v1.Node{node1}),
 					},
 				},
 			},
@@ -1211,7 +1211,7 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 				setupState := func() {
 					controller.nodeLister = newFakeNodeLister(nil, state.nodes...)
 					for _, endpointSlice := range state.endpointSlices {
-						controller.endpointsStore.Add(endpointSlice)
+						controller.endpointSliceStore.Add(endpointSlice)
 					}
 					if state.syncCallErr {
 						cloud.Err = fmt.Errorf("error please")
@@ -1219,7 +1219,7 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 				}
 				cleanupState := func() {
 					for _, endpointSlice := range state.endpointSlices {
-						controller.endpointsStore.Delete(endpointSlice)
+						controller.endpointSliceStore.Delete(endpointSlice)
 					}
 					cloud.Err = nil
 				}

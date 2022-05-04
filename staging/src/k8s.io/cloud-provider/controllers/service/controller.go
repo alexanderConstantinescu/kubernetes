@@ -25,16 +25,19 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	discoveryinformer "k8s.io/client-go/informers/discovery/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -87,15 +90,15 @@ type Controller struct {
 	clusterName      string
 	balancer         cloudprovider.LoadBalancer
 	// TODO(#85155): Stop relying on this and remove the cache completely.
-	cache                 *serviceCache
-	serviceLister         corelisters.ServiceLister
-	serviceListerSynced   cache.InformerSynced
-	eventBroadcaster      record.EventBroadcaster
-	eventRecorder         record.EventRecorder
-	nodeLister            corelisters.NodeLister
-	nodeListerSynced      cache.InformerSynced
-	endpointsLister       corelisters.EndpointsLister
-	endpointsListerSynced cache.InformerSynced
+	cache               *serviceCache
+	serviceLister       corelisters.ServiceLister
+	serviceListerSynced cache.InformerSynced
+	eventBroadcaster    record.EventBroadcaster
+	eventRecorder       record.EventRecorder
+	nodeLister          corelisters.NodeLister
+	nodeListerSynced    cache.InformerSynced
+	endpointSliceLister discoverylisters.EndpointSliceLister
+	endpointSliceSynced cache.InformerSynced
 	// services that need to be synced
 	queue workqueue.RateLimitingInterface
 
@@ -120,7 +123,7 @@ func New(
 	cloud cloudprovider.Interface,
 	kubeClient clientset.Interface,
 	serviceInformer coreinformers.ServiceInformer,
-	endpointsInformer coreinformers.EndpointsInformer,
+	endpointSliceInformer discoveryinformer.EndpointSliceInformer,
 	nodeInformer coreinformers.NodeInformer,
 	clusterName string,
 	featureGate featuregate.FeatureGate,
@@ -138,18 +141,18 @@ func New(
 
 	registerMetrics()
 	s := &Controller{
-		cloud:                 cloud,
-		knownHosts:            []*v1.Node{},
-		kubeClient:            kubeClient,
-		clusterName:           clusterName,
-		cache:                 &serviceCache{serviceMap: make(map[string]*cachedService)},
-		eventBroadcaster:      broadcaster,
-		eventRecorder:         recorder,
-		nodeLister:            nodeInformer.Lister(),
-		nodeListerSynced:      nodeInformer.Informer().HasSynced,
-		endpointsLister:       endpointsInformer.Lister(),
-		endpointsListerSynced: endpointsInformer.Informer().HasSynced,
-		queue:                 workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
+		cloud:               cloud,
+		knownHosts:          []*v1.Node{},
+		kubeClient:          kubeClient,
+		clusterName:         clusterName,
+		cache:               &serviceCache{serviceMap: make(map[string]*cachedService)},
+		eventBroadcaster:    broadcaster,
+		eventRecorder:       recorder,
+		nodeLister:          nodeInformer.Lister(),
+		nodeListerSynced:    nodeInformer.Informer().HasSynced,
+		endpointSliceLister: endpointSliceInformer.Lister(),
+		endpointSliceSynced: endpointSliceInformer.Informer().HasSynced,
+		queue:               workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
 		// nodeSyncCh has a size 1 buffer. Only one pending sync signal would be cached.
 		nodeSyncCh: make(chan interface{}, 1),
 	}
@@ -251,7 +254,7 @@ func (s *Controller) Run(ctx context.Context, workers int) {
 	klog.Info("Starting service controller")
 	defer klog.Info("Shutting down service controller")
 
-	if !cache.WaitForNamedCacheSync("service", ctx.Done(), s.serviceListerSynced, s.nodeListerSynced, s.endpointsListerSynced) {
+	if !cache.WaitForNamedCacheSync("service", ctx.Done(), s.serviceListerSynced, s.nodeListerSynced, s.endpointSliceSynced) {
 		return
 	}
 
@@ -864,15 +867,14 @@ func (s *Controller) needsSync(svc *v1.Service, oldNodes, newNodes []*v1.Node) b
 }
 
 func (s *Controller) serviceHasEndpointsOnNodes(svc *v1.Service, nodeNames sets.String) bool {
-	ep, err := s.endpointsLister.Endpoints(svc.Namespace).Get(svc.Name)
+	epsLabelSelector := labels.Set(map[string]string{discovery.LabelServiceName: svc.Name}).AsSelectorPreValidated()
+	endpointSlices, err := s.endpointSliceLister.EndpointSlices(svc.Namespace).List(epsLabelSelector)
 	if err != nil {
-		// The only error returned by the indexer for a Get request is IsNotFound. If we end up here
-		// it means there are no endpoints for the service, so it has no endpoints on any node.
 		return false
 	}
-	for _, subset := range ep.Subsets {
-		for _, address := range subset.Addresses {
-			if address.NodeName != nil && nodeNames.Has(*address.NodeName) {
+	for _, endpointSlice := range endpointSlices {
+		for _, ep := range endpointSlice.Endpoints {
+			if ep.NodeName != nil && nodeNames.Has(*ep.NodeName) {
 				return true
 			}
 		}

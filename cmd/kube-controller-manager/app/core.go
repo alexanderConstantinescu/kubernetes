@@ -82,7 +82,7 @@ func startServiceController(ctx context.Context, controllerContext ControllerCon
 		controllerContext.Cloud,
 		controllerContext.ClientBuilder.ClientOrDie("service-controller"),
 		controllerContext.InformerFactory.Core().V1().Services(),
-		controllerContext.InformerFactory.Core().V1().Endpoints(),
+		controllerContext.InformerFactory.Discovery().V1().EndpointSlices(),
 		controllerContext.InformerFactory.Core().V1().Nodes(),
 		controllerContext.ComponentConfig.KubeCloudShared.ClusterName,
 		utilfeature.DefaultFeatureGate,
