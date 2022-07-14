@@ -620,7 +620,7 @@ func NewProxier(
 		klog.InfoS("ClusterCIDR not specified, unable to distinguish between internal and external traffic")
 	}
 
-	serviceHealthServer := healthcheck.NewServiceHealthServer(hostname, recorder, []string{} /* windows listen to all node addresses */)
+	serviceHealthServer := healthcheck.NewServiceHealthServer(hostname, recorder, []string{} /* windows listen to all node addresses */, healthzServer)
 	hns, supportedFeatures := newHostNetworkService()
 	hnsNetworkName, err := getNetworkName(config.NetworkName)
 	if err != nil {

@@ -279,7 +279,7 @@ func NewProxier(ipt utiliptables.Interface,
 	masqueradeMark := fmt.Sprintf("%#08x", masqueradeValue)
 	klog.V(2).InfoS("Using iptables mark for masquerade", "ipFamily", ipt.Protocol(), "mark", masqueradeMark)
 
-	serviceHealthServer := healthcheck.NewServiceHealthServer(hostname, recorder, nodePortAddresses)
+	serviceHealthServer := healthcheck.NewServiceHealthServer(hostname, recorder, nodePortAddresses, healthzServer)
 
 	ipFamily := v1.IPv4Protocol
 	if ipt.IsIPv6() {

@@ -60,7 +60,7 @@ type ServiceHealthServer interface {
 	SyncNode(node *v1.Node)
 }
 
-func newServiceHealthServer(hostname string, recorder events.EventRecorder, listener listener, factory httpServerFactory, nodePortAddresses []string) ServiceHealthServer {
+func newServiceHealthServer(hostname string, recorder events.EventRecorder, listener listener, factory httpServerFactory, nodePortAddresses []string, healthzServer ProxierHealthUpdater) ServiceHealthServer {
 
 	nodeAddresses, err := utilproxy.GetNodeAddresses(nodePortAddresses, utilproxy.RealNetwork{})
 	if err != nil || nodeAddresses.Len() == 0 {
@@ -84,14 +84,15 @@ func newServiceHealthServer(hostname string, recorder events.EventRecorder, list
 		listener:      listener,
 		httpFactory:   factory,
 		nodeState:     nodeState{},
+		healthzServer: healthzServer,
 		services:      map[types.NamespacedName]*hcInstance{},
 		nodeAddresses: nodeAddresses,
 	}
 }
 
 // NewServiceHealthServer allocates a new service healthcheck server manager
-func NewServiceHealthServer(hostname string, recorder events.EventRecorder, nodePortAddresses []string) ServiceHealthServer {
-	return newServiceHealthServer(hostname, recorder, stdNetListener{}, stdHTTPServerFactory{}, nodePortAddresses)
+func NewServiceHealthServer(hostname string, recorder events.EventRecorder, nodePortAddresses []string, healthzServer ProxierHealthUpdater) ServiceHealthServer {
+	return newServiceHealthServer(hostname, recorder, stdNetListener{}, stdHTTPServerFactory{}, nodePortAddresses, healthzServer)
 }
 
 type nodeState struct {
@@ -107,7 +108,8 @@ type server struct {
 	listener      listener
 	httpFactory   httpServerFactory
 
-	nodeState nodeState
+	nodeState     nodeState
+	healthzServer ProxierHealthUpdater
 
 	lock     sync.RWMutex
 	services map[types.NamespacedName]*hcInstance
@@ -272,9 +274,11 @@ func (h hcHandler) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
 	nodeOK := !h.hcs.nodeState.isNotReady && !h.hcs.nodeState.isToBeDeleted
 	h.hcs.lock.RUnlock()
 
+	healthzHealthy, _, _ := h.hcs.healthzServer.IsHealthy()
+
 	resp.Header().Set("Content-Type", "application/json")
 	resp.Header().Set("X-Content-Type-Options", "nosniff")
-	if count != 0 && nodeOK {
+	if count != 0 && nodeOK && healthzHealthy {
 		resp.WriteHeader(http.StatusOK)
 	} else {
 		resp.WriteHeader(http.StatusServiceUnavailable)

@@ -451,7 +451,7 @@ func NewProxier(ipt utiliptables.Interface,
 		scheduler = defaultScheduler
 	}
 
-	serviceHealthServer := healthcheck.NewServiceHealthServer(hostname, recorder, nodePortAddresses)
+	serviceHealthServer := healthcheck.NewServiceHealthServer(hostname, recorder, nodePortAddresses, healthzServer)
 
 	ipFamilyMap := utilproxy.MapCIDRsByIPFamily(nodePortAddresses)
 	nodePortAddresses = ipFamilyMap[ipFamily]

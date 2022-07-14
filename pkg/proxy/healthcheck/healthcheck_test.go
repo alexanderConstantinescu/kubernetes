@@ -127,8 +127,10 @@ type healthzPayload struct {
 func TestServer(t *testing.T) {
 	listener := newFakeListener()
 	httpFactory := newFakeHTTPServerFactory()
+	fakeClock := testingclock.NewFakeClock(time.Now())
+	hs := newProxierHealthServer(listener, httpFactory, fakeClock, "127.0.0.1:10256", 10*time.Second, nil, nil)
 
-	hcsi := newServiceHealthServer("hostname", nil, listener, httpFactory, []string{})
+	hcsi := newServiceHealthServer("hostname", nil, listener, httpFactory, []string{}, hs)
 	hcs := hcsi.(*server)
 	if len(hcs.services) != 0 {
 		t.Errorf("expected 0 services, got %d", len(hcs.services))
@@ -428,11 +430,13 @@ func testHealthzHandler(server httpServer, status int, t *testing.T) {
 func TestServerWithSelectiveListeningAddress(t *testing.T) {
 	listener := newFakeListener()
 	httpFactory := newFakeHTTPServerFactory()
+	fakeClock := testingclock.NewFakeClock(time.Now())
+	hs := newProxierHealthServer(listener, httpFactory, fakeClock, "127.0.0.1:10256", 10*time.Second, nil, nil)
 
 	// limiting addresses to loop back. We don't want any cleverness here around getting IP for
 	// machine nor testing ipv6 || ipv4. using loop back guarantees the test will work on any machine
 
-	hcsi := newServiceHealthServer("hostname", nil, listener, httpFactory, []string{"127.0.0.0/8"})
+	hcsi := newServiceHealthServer("hostname", nil, listener, httpFactory, []string{"127.0.0.0/8"}, hs)
 	hcs := hcsi.(*server)
 	if len(hcs.services) != 0 {
 		t.Errorf("expected 0 services, got %d", len(hcs.services))
