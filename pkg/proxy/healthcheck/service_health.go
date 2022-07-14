@@ -36,6 +36,12 @@ import (
 	utilproxy "k8s.io/kubernetes/pkg/proxy/util"
 )
 
+const (
+	// ToBeDeletedTaint is a taint used by the CLuster Autoscaler before marking a node for deletion. Defined in
+	// https://github.com/kubernetes/autoscaler/blob/e80ab518340f88f364fe3ef063f8303755125971/cluster-autoscaler/utils/deletetaint/delete.go#L36
+	ToBeDeletedTaint = "ToBeDeletedByClusterAutoscaler"
+)
+
 // ServiceHealthServer serves HTTP endpoints for each service name, with results
 // based on the endpoints.  If there are 0 endpoints for a service, it returns a
 // 503 "Service Unavailable" error (telling LBs not to use this node).  If there
@@ -50,6 +56,8 @@ type ServiceHealthServer interface {
 	// not exist will be dropped.  The value of the map is the number of
 	// endpoints the service has on this node.
 	SyncEndpoints(newEndpoints map[types.NamespacedName]int) error
+	// Sync the new node and determine if its Ready and Tainted, or not.
+	SyncNode(node *v1.Node)
 }
 
 func newServiceHealthServer(hostname string, recorder events.EventRecorder, listener listener, factory httpServerFactory, nodePortAddresses []string) ServiceHealthServer {
@@ -75,6 +83,7 @@ func newServiceHealthServer(hostname string, recorder events.EventRecorder, list
 		recorder:      recorder,
 		listener:      listener,
 		httpFactory:   factory,
+		nodeState:     nodeState{},
 		services:      map[types.NamespacedName]*hcInstance{},
 		nodeAddresses: nodeAddresses,
 	}
@@ -85,6 +94,11 @@ func NewServiceHealthServer(hostname string, recorder events.EventRecorder, node
 	return newServiceHealthServer(hostname, recorder, stdNetListener{}, stdHTTPServerFactory{}, nodePortAddresses)
 }
 
+type nodeState struct {
+	isNotReady    bool
+	isToBeDeleted bool
+}
+
 type server struct {
 	hostname string
 	// node addresses where health check port will listen on
@@ -92,6 +106,8 @@ type server struct {
 	recorder      events.EventRecorder // can be nil
 	listener      listener
 	httpFactory   httpServerFactory
+
+	nodeState nodeState
 
 	lock     sync.RWMutex
 	services map[types.NamespacedName]*hcInstance
@@ -144,6 +160,30 @@ func (hcs *server) SyncServices(newServices map[types.NamespacedName]uint16) err
 		hcs.services[nsn] = svc
 	}
 	return nil
+}
+
+func (hcs *server) SyncNode(node *v1.Node) {
+	if node == nil {
+		hcs.nodeState.isNotReady = true
+		hcs.nodeState.isToBeDeleted = true
+		return
+	}
+	isToBeDeleted := false
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == ToBeDeletedTaint {
+			isToBeDeleted = true
+			break
+		}
+	}
+	isNotReady := len(node.Status.Conditions) == 0
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == v1.NodeReady && cond.Status != v1.ConditionTrue {
+			isNotReady = true
+			break
+		}
+	}
+	hcs.nodeState.isToBeDeleted = isToBeDeleted
+	hcs.nodeState.isNotReady = isNotReady
 }
 
 type hcInstance struct {
@@ -229,14 +269,15 @@ func (h hcHandler) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
 		return
 	}
 	count := svc.endpoints
+	nodeOK := !h.hcs.nodeState.isNotReady && !h.hcs.nodeState.isToBeDeleted
 	h.hcs.lock.RUnlock()
 
 	resp.Header().Set("Content-Type", "application/json")
 	resp.Header().Set("X-Content-Type-Options", "nosniff")
-	if count == 0 {
-		resp.WriteHeader(http.StatusServiceUnavailable)
-	} else {
+	if count != 0 && nodeOK {
 		resp.WriteHeader(http.StatusOK)
+	} else {
+		resp.WriteHeader(http.StatusServiceUnavailable)
 	}
 	fmt.Fprint(resp, strings.Trim(dedent.Dedent(fmt.Sprintf(`
 		{
@@ -285,3 +326,5 @@ func (fake FakeServiceHealthServer) SyncServices(_ map[types.NamespacedName]uint
 func (fake FakeServiceHealthServer) SyncEndpoints(_ map[types.NamespacedName]int) error {
 	return nil
 }
+
+func (fake FakeServiceHealthServer) SyncNode(node *v1.Node) {}

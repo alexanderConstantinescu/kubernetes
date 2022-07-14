@@ -964,6 +964,24 @@ func (proxier *Proxier) OnEndpointSlicesSynced() {
 	proxier.syncProxyRules()
 }
 
+// OnNodeAdd is called whenever creation of new node object
+// is observed.
+func (proxier *Proxier) OnNodeAdd(node *v1.Node) {
+	proxier.serviceHealthServer.SyncNode(node)
+}
+
+// OnNodeUpdate is called whenever modification of an existing
+// node object is observed.
+func (proxier *Proxier) OnNodeUpdate(_, node *v1.Node) {
+	proxier.serviceHealthServer.SyncNode(node)
+}
+
+// OnNodeDelete is called whenever deletion of an existing node
+// object is observed.
+func (proxier *Proxier) OnNodeDelete(node *v1.Node) {
+	proxier.serviceHealthServer.SyncNode(nil)
+}
+
 func (proxier *Proxier) cleanupAllPolicies() {
 	for svcName, svc := range proxier.serviceMap {
 		svcInfo, ok := svc.(*serviceInfo)
