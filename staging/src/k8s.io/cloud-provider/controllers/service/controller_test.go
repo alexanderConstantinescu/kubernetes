@@ -1563,8 +1563,7 @@ func TestPatchStatus(t *testing.T) {
 	}
 }
 
-func Test_getNodeConditionPredicate(t *testing.T) {
-	validNodeStatus := v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: "Test"}}}
+func Test_respectsPredicates(t *testing.T) {
 	tests := []struct {
 		name string
 
@@ -1574,20 +1573,18 @@ func Test_getNodeConditionPredicate(t *testing.T) {
 		{want: false, input: &v1.Node{}},
 		{want: true, input: &v1.Node{Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}},
 		{want: false, input: &v1.Node{Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionFalse}}}}},
-		{want: true, input: &v1.Node{Spec: v1.NodeSpec{Unschedulable: true}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}},
+		{want: false, input: &v1.Node{Spec: v1.NodeSpec{Unschedulable: true}, Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}}},
 
-		{want: true, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}}},
-		{want: false, input: &v1.Node{Status: validNodeStatus, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.LabelNodeExcludeBalancers: ""}}}},
+		{want: true, input: &v1.Node{Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}}},
+		{want: false, input: &v1.Node{Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}}, ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.LabelNodeExcludeBalancers: ""}}}},
 
 		{want: false, input: &v1.Node{Status: v1.NodeStatus{Conditions: []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}}},
 			Spec: v1.NodeSpec{Taints: []v1.Taint{{Key: ToBeDeletedTaint, Value: fmt.Sprint(time.Now().Unix()), Effect: v1.TaintEffectNoSchedule}}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := &Controller{}
-
-			if result := c.getNodeConditionPredicate()(tt.input); result != tt.want {
-				t.Errorf("getNodeConditionPredicate() = %v, want %v", result, tt.want)
+			if result := respectsPredicates(tt.input, allNodePredicates...); result != tt.want {
+				t.Errorf("matchesPredicates() = %v, want %v", result, tt.want)
 			}
 		})
 	}
@@ -1644,7 +1641,7 @@ func TestListWithPredicate(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			get, err := listWithPredicate(fakeInformerFactory.Core().V1().Nodes().Lister(), test.predicate)
+			get, err := listWithPredicates(fakeInformerFactory.Core().V1().Nodes().Lister(), test.predicate)
 			sort.Slice(get, func(i, j int) bool {
 				return get[i].Name < get[j].Name
 			})
@@ -1680,6 +1677,64 @@ func Test_shouldSyncNode(t *testing.T) {
 				},
 				Spec: v1.NodeSpec{
 					Unschedulable: true,
+				},
+			},
+			shouldSync: true,
+		},
+		{
+			name: "ToBeDeletedTaint changed",
+			oldNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node",
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{
+							Key: ToBeDeletedTaint,
+						},
+					},
+				},
+			},
+			newNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node",
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{},
+				},
+			},
+			shouldSync: true,
+		},
+		{
+			name: "labels changed while Ready=False",
+			oldNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "node",
+					Labels: map[string]string{},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:   v1.NodeReady,
+							Status: v1.ConditionFalse,
+						},
+					},
+				},
+			},
+			newNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node",
+					Labels: map[string]string{
+						v1.LabelNodeExcludeBalancers: "",
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:   v1.NodeReady,
+							Status: v1.ConditionFalse,
+						},
+					},
 				},
 			},
 			shouldSync: true,
@@ -1768,9 +1823,7 @@ func Test_shouldSyncNode(t *testing.T) {
 		t.Run(testcase.name, func(t *testing.T) {
 			shouldSync := shouldSyncNode(testcase.oldNode, testcase.newNode)
 			if shouldSync != testcase.shouldSync {
-				t.Logf("actual shouldSyncNode: %v", shouldSync)
-				t.Logf("expected shouldSyncNode: %v", testcase.shouldSync)
-				t.Errorf("unexpected result from shouldSyncNode")
+				t.Errorf("unexpected result from shouldSyncNode, expected: %v, actual: %v", testcase.shouldSync, shouldSync)
 			}
 		})
 	}
