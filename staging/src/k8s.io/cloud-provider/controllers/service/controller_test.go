@@ -107,8 +107,8 @@ func newController() (*Controller, *fakecloud.Cloud, *fake.Clientset) {
 		eventRecorder:    recorder,
 		nodeLister:       newFakeNodeLister(nil),
 		nodeListerSynced: nodeInformer.Informer().HasSynced,
-		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
-		nodeSyncCh:       make(chan interface{}, 1),
+		serviceQueue:     workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
+		nodeQueue:        workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "node"),
 		lastSyncedNodes:  []*v1.Node{},
 	}
 
@@ -913,7 +913,7 @@ func TestProcessServiceCreateOrUpdate(t *testing.T) {
 				cachedServiceTest.state = svc
 				controller.cache.set(keyExpected, cachedServiceTest)
 
-				keyGot, quit := controller.queue.Get()
+				keyGot, quit := controller.serviceQueue.Get()
 				if quit {
 					t.Fatalf("get no queue element")
 				}
@@ -1998,24 +1998,6 @@ func Test_shouldSyncNode(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestTriggerNodeSync(t *testing.T) {
-	controller, _, _ := newController()
-
-	tryReadFromChannel(t, controller.nodeSyncCh, false)
-	controller.triggerNodeSync()
-	tryReadFromChannel(t, controller.nodeSyncCh, true)
-	tryReadFromChannel(t, controller.nodeSyncCh, false)
-	tryReadFromChannel(t, controller.nodeSyncCh, false)
-	tryReadFromChannel(t, controller.nodeSyncCh, false)
-	controller.triggerNodeSync()
-	controller.triggerNodeSync()
-	controller.triggerNodeSync()
-	tryReadFromChannel(t, controller.nodeSyncCh, true)
-	tryReadFromChannel(t, controller.nodeSyncCh, false)
-	tryReadFromChannel(t, controller.nodeSyncCh, false)
-	tryReadFromChannel(t, controller.nodeSyncCh, false)
 }
 
 func tryReadFromChannel(t *testing.T, ch chan interface{}, expectValue bool) {
