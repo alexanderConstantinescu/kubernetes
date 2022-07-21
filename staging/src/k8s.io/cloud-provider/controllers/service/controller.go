@@ -971,7 +971,7 @@ var (
 
 func getNodePredicatesForService(service *v1.Service) []NodeConditionPredicate {
 	if service.Spec.ExternalTrafficPolicy == v1.ServiceExternalTrafficPolicyTypeLocal {
-		return []NodeConditionPredicate{nodeIncludedPredicate, nodeSchedulablePredicate, nodeUnTaintedPredicate}
+		return []NodeConditionPredicate{nodeIncludedPredicate}
 	}
 	return allNodePredicates
 }
