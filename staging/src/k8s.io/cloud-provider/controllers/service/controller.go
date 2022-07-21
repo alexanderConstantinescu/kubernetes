@@ -73,12 +73,10 @@ type serviceCache struct {
 // Controller keeps cloud provider service resources
 // (like load balancers) in sync with the registry.
 type Controller struct {
-	cloud            cloudprovider.Interface
-	knownHosts       []*v1.Node
-	servicesToUpdate sets.String
-	kubeClient       clientset.Interface
-	clusterName      string
-	balancer         cloudprovider.LoadBalancer
+	cloud       cloudprovider.Interface
+	kubeClient  clientset.Interface
+	clusterName string
+	balancer    cloudprovider.LoadBalancer
 	// TODO(#85155): Stop relying on this and remove the cache completely.
 	cache               *serviceCache
 	serviceLister       corelisters.ServiceLister
@@ -95,8 +93,6 @@ type Controller struct {
 	nodeSyncLock sync.Mutex
 	// nodeSyncCh triggers nodeSyncLoop to run
 	nodeSyncCh chan interface{}
-	// needFullSync indicates if the nodeSyncInternal will do a full node sync on all LB services.
-	needFullSync bool
 }
 
 // New returns a new service controller to keep cloud provider service resources
@@ -123,7 +119,6 @@ func New(
 	registerMetrics()
 	s := &Controller{
 		cloud:            cloud,
-		knownHosts:       []*v1.Node{},
 		kubeClient:       kubeClient,
 		clusterName:      clusterName,
 		cache:            &serviceCache{serviceMap: make(map[string]*cachedService)},
@@ -197,15 +192,6 @@ func New(
 	return s, nil
 }
 
-// needFullSyncAndUnmark returns the value and needFullSync and marks the field to false.
-func (s *Controller) needFullSyncAndUnmark() bool {
-	s.nodeSyncLock.Lock()
-	defer s.nodeSyncLock.Unlock()
-	ret := s.needFullSync
-	s.needFullSync = false
-	return ret
-}
-
 // obj could be an *v1.Service, or a DeletionFinalStateUnknown marker item.
 func (s *Controller) enqueueService(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
@@ -251,22 +237,6 @@ func (s *Controller) Run(ctx context.Context, workers int) {
 func (s *Controller) triggerNodeSync() {
 	s.nodeSyncLock.Lock()
 	defer s.nodeSyncLock.Unlock()
-	newHosts, err := listWithPredicates(s.nodeLister, allNodePredicates...)
-	if err != nil {
-		runtime.HandleError(fmt.Errorf("Failed to retrieve current set of nodes from node lister: %v", err))
-		// if node list cannot be retrieve, trigger full node sync to be safe.
-		s.needFullSync = true
-	} else if !nodeSlicesEqualForLB(newHosts, s.knownHosts) {
-		// Here the last known state is recorded as knownHosts. For each
-		// LB update, the latest node list is retrieved. This is to prevent
-		// a stale set of nodes were used to be update loadbalancers when
-		// there are many loadbalancers in the clusters. nodeSyncInternal
-		// would be triggered until all loadbalancers are updated to the new state.
-		klog.V(2).Infof("Node changes detected, triggering a full node sync on all loadbalancer services")
-		s.needFullSync = true
-		s.knownHosts = newHosts
-	}
-
 	select {
 	case s.nodeSyncCh <- struct{}{}:
 		klog.V(4).Info("Triggering nodeSync")
@@ -665,13 +635,6 @@ func nodeNames(nodes []*v1.Node) sets.String {
 	return ret
 }
 
-func nodeSlicesEqualForLB(x, y []*v1.Node) bool {
-	if len(x) != len(y) {
-		return false
-	}
-	return nodeNames(x).Equal(nodeNames(y))
-}
-
 func shouldSyncNode(oldNode, newNode *v1.Node) bool {
 	for _, p := range allNodePredicates {
 		if p(oldNode) != p(newNode) {
@@ -691,33 +654,12 @@ func (s *Controller) nodeSyncInternal(ctx context.Context, workers int) {
 		nodeSyncLatency.Observe(latency)
 	}()
 
-	if !s.needFullSyncAndUnmark() {
-		// The set of nodes in the cluster hasn't changed, but we can retry
-		// updating any services that we failed to update last time around.
-		// It is required to call `s.cache.get()` on each Service in case there was
-		// an update event that occurred between retries.
-		var servicesToUpdate []*v1.Service
-		for key := range s.servicesToUpdate {
-			cachedService, exist := s.cache.get(key)
-			if !exist {
-				klog.Errorf("Service %q should be in the cache but not", key)
-				continue
-			}
-			servicesToUpdate = append(servicesToUpdate, cachedService.state)
-		}
-
-		s.servicesToUpdate = s.updateLoadBalancerHosts(ctx, servicesToUpdate, workers)
-		return
-	}
 	klog.V(2).Infof("Syncing backends for all LB services.")
-
-	// Try updating all services, and save the failed ones to try again next
-	// round.
 	servicesToUpdate := s.cache.allServices()
 	numServices := len(servicesToUpdate)
-	s.servicesToUpdate = s.updateLoadBalancerHosts(ctx, servicesToUpdate, workers)
+	servicesToRetry := s.updateLoadBalancerHosts(ctx, servicesToUpdate, workers)
 	klog.V(2).Infof("Successfully updated %d out of %d load balancers to direct traffic to the updated set of nodes",
-		numServices-len(s.servicesToUpdate), numServices)
+		numServices-len(servicesToRetry), numServices)
 }
 
 // nodeSyncService syncs the nodes for one load balancer type service
@@ -758,7 +700,6 @@ func (s *Controller) updateLoadBalancerHosts(ctx context.Context, services []*v1
 		key := fmt.Sprintf("%s/%s", services[piece].Namespace, services[piece].Name)
 		servicesToRetry.Insert(key)
 	}
-
 	workqueue.ParallelizeUntil(ctx, workers, len(services), doWork)
 	klog.V(4).Infof("Finished updateLoadBalancerHosts")
 	return servicesToRetry
