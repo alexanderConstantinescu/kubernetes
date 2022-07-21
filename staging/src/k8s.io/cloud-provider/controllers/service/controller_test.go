@@ -662,12 +662,7 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 					nodes: []*v1.Node{node1, node2Tainted, node3},
 				},
 			},
-			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
-				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{},
 		},
 		{
 			desc:         "1 node goes unschedulable",
@@ -677,12 +672,7 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 					nodes: []*v1.Node{node1, node2Unschedulable, node3},
 				},
 			},
-			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{
-				{Service: newETPLocalService("s0", "777", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-				{Service: newETPLocalService("s1", "888", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-				{Service: newETPLocalService("s3", "999", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-				{Service: newETPLocalService("s4", "123", v1.ServiceTypeLoadBalancer), Hosts: []*v1.Node{node1, node3}},
-			},
+			expectedUpdateCalls: []fakecloud.UpdateBalancerCall{},
 		},
 		{
 			desc:         "1 node goes Ready",
