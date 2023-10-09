@@ -176,7 +176,7 @@ func newController(stopCh <-chan struct{}, objects ...runtime.Object) (*Controll
 		nodeListerSynced:    nodeInformer.Informer().HasSynced,
 		serviceQueue:        workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
 		nodeQueue:           workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "node"),
-		lastSyncedNodes:     []*v1.Node{},
+		lastSyncedNodes:     make(map[string][]*v1.Node),
 	}
 
 	informerFactory.Start(stopCh)
@@ -604,7 +604,10 @@ func TestNodeChangesForExternalTrafficPolicyLocalServices(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			controller.lastSyncedNodes = tc.initialState
+			for _, svc := range services {
+				key, _ := cache.MetaNamespaceKeyFunc(svc)
+				controller.lastSyncedNodes[key] = tc.initialState
+			}
 
 			for _, state := range tc.stateChanges {
 				setupState := func() {
@@ -777,7 +780,10 @@ func TestNodeChangesForStableNodeSetEnabled(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			controller.lastSyncedNodes = tc.initialState
+			for _, svc := range services {
+				key, _ := cache.MetaNamespaceKeyFunc(svc)
+				controller.lastSyncedNodes[key] = tc.initialState
+			}
 
 			for _, state := range tc.stateChanges {
 				setupState := func() {
@@ -978,7 +984,10 @@ func TestNodesNotEqual(t *testing.T) {
 			defer cancel()
 			controller.nodeLister = newFakeNodeLister(nil, tc.newNodes...)
 
-			controller.lastSyncedNodes = tc.lastSyncNodes
+			for _, svc := range services {
+				key, _ := cache.MetaNamespaceKeyFunc(svc)
+				controller.lastSyncedNodes[key] = tc.lastSyncNodes
+			}
 
 			controller.updateLoadBalancerHosts(ctx, services, 5)
 			compareUpdateCalls(t, tc.expectedUpdateCalls, cloud.UpdateCalls)
@@ -1392,7 +1401,7 @@ func TestSlowNodeSync(t *testing.T) {
 	expectedUpdateCalls := []fakecloud.UpdateBalancerCall{
 		{Service: service1, Hosts: []*v1.Node{node1, node2}},
 		{Service: service2, Hosts: []*v1.Node{node1, node2, node3}},
-		{Service: service2, Hosts: []*v1.Node{node1, node2}},
+		{Service: service2, Hosts: []*v1.Node{node1, node2, node3}},
 	}
 
 	wg := sync.WaitGroup{}
