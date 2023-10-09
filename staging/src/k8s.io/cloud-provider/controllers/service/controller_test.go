@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -68,8 +69,9 @@ func newService(name string, serviceType v1.ServiceType, tweaks ...serviceTweak)
 			Namespace: "default",
 		},
 		Spec: v1.ServiceSpec{
-			Type:  serviceType,
-			Ports: makeServicePort(v1.ProtocolTCP, 0),
+			Type:                  serviceType,
+			Ports:                 makeServicePort(v1.ProtocolTCP, 0),
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyCluster,
 		},
 	}
 	for _, tw := range tweaks {
@@ -1455,6 +1457,174 @@ func TestSlowNodeSync(t *testing.T) {
 	time.Sleep(duration)
 	// Sync the service
 	controller.syncService(context.TODO(), key)
+	wg.Wait()
+}
+
+func TestSlowNodeSyncCoalescedEventsWillSucceed(t *testing.T) {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	duration := time.Millisecond
+
+	cloud := &fakecloud.Cloud{
+		UpdateCallCh: make(chan fakecloud.UpdateBalancerCall, 1000),
+		RequestDelay: 4 * duration,
+	}
+	cloud.Region = region
+
+	node := makeNode(tweakName("node1"), tweakProviderID(""))
+	service := newService("service1", v1.ServiceTypeLoadBalancer)
+	serviceKey, _ := cache.MetaNamespaceKeyFunc(service)
+
+	controller := &Controller{
+		lastSyncedNodes: map[string][]*v1.Node{
+			serviceKey: {node},
+		},
+	}
+
+	kubeClient := fake.NewSimpleClientset(node, service)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	nodeInformer := informerFactory.Core().V1().Nodes()
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartStructuredLogging(0)
+	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
+
+	nodeQueue := make(chan *v1.Node)
+	nodeInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			UpdateFunc: func(old, cur interface{}) {
+				curNode, ok := cur.(*v1.Node)
+				if !ok {
+					return
+				}
+				nodeQueue <- curNode
+			},
+		},
+	)
+
+	informerFactory.Start(stopCh)
+	informerFactory.WaitForCacheSync(stopCh)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-nodeQueue:
+				newNodes, _ := listWithPredicates(nodeInformer.Lister(), getNodePredicatesForService(service)...)
+				oldNodes := filterWithPredicates(controller.getLastSyncedNodes(service), getNodePredicatesForService(service)...)
+				controller.storeLastSyncedNodes(service, newNodes)
+				if !nodesSufficientlyEqual(oldNodes, newNodes) {
+					return
+				}
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		eventLimit := 10
+		for i := 0; i < eventLimit; i++ {
+			if i >= 8 {
+				node.Spec.ProviderID = providerID
+			}
+			node.Labels["fired-event"] = strconv.Itoa(i)
+			kubeClient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{})
+			time.Sleep(10 * duration)
+		}
+	}()
+
+	wg.Wait()
+}
+
+func TestSlowNodeSyncCoalescedEventsWillFail(t *testing.T) {
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+
+	duration := time.Millisecond
+
+	cloud := &fakecloud.Cloud{
+		UpdateCallCh: make(chan fakecloud.UpdateBalancerCall, 1000),
+		RequestDelay: 4 * duration,
+	}
+	cloud.Region = region
+
+	node := makeNode(tweakName("node1"), tweakProviderID(""))
+	service := newService("service1", v1.ServiceTypeLoadBalancer)
+	serviceKey, _ := cache.MetaNamespaceKeyFunc(service)
+
+	controller := &Controller{
+		lastSyncedNodes: map[string][]*v1.Node{
+			serviceKey: {node},
+		},
+	}
+
+	kubeClient := fake.NewSimpleClientset(node, service)
+	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	nodeInformer := informerFactory.Core().V1().Nodes()
+	broadcaster := record.NewBroadcaster()
+	broadcaster.StartStructuredLogging(0)
+	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: kubeClient.CoreV1().Events("")})
+
+	nodeQueue := make(chan *v1.Node)
+	nodeInformer.Informer().AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			UpdateFunc: func(old, cur interface{}) {
+				oldNode, ok := old.(*v1.Node)
+				if !ok {
+					return
+				}
+
+				curNode, ok := cur.(*v1.Node)
+				if !ok {
+					return
+				}
+
+				if !shouldSyncUpdatedNode(oldNode, curNode) {
+					return
+				}
+
+				nodeQueue <- curNode
+			},
+		},
+	)
+
+	informerFactory.Start(stopCh)
+	informerFactory.WaitForCacheSync(stopCh)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-nodeQueue:
+				newNodes, _ := listWithPredicates(nodeInformer.Lister(), getNodePredicatesForService(service)...)
+				oldNodes := filterWithPredicates(controller.getLastSyncedNodes(service), getNodePredicatesForService(service)...)
+				controller.storeLastSyncedNodes(service, newNodes)
+				if !nodesSufficientlyEqual(oldNodes, newNodes) {
+					return
+				}
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		eventLimit := 10
+		for i := 0; i < eventLimit; i++ {
+			if i >= 8 {
+				node.Spec.ProviderID = providerID
+			}
+			node.Labels["fired-event"] = strconv.Itoa(i)
+			kubeClient.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{})
+			time.Sleep(10 * duration)
+		}
+	}()
+
 	wg.Wait()
 }
 
